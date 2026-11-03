@@ -1,206 +1,170 @@
-// ponytail — OpenCode plugin.
-//
-// Injects the ponytail ruleset into every chat's system prompt at the active
-// intensity, persists /ponytail mode switches, and registers the /ponytail
-// commands and skills so they work when the package is installed from npm.
-// Reuses the shared instruction builder so Claude Code, Codex, pi, and OpenCode
-// all read one source of truth.
-//
-// OpenCode loads this as a server plugin — add it to your opencode.json:
-//   { "plugins": ["@dietrichgebert/ponytail"] }
-//
-// One default export serves both plugin APIs: V2 reads `id` + `setup`, V1 calls
-// `server()`.
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-import { createRequire } from 'node:module';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// In-memory session map keyed by sessionID (falls back to per-project hashed state file)
+const sessionModes = new Map()
 
-// The shared instruction builder is CommonJS; bridge to it from this ES module.
-const require = createRequire(import.meta.url);
-const { getPonytailInstructions } = require('../../hooks/ponytail-instructions');
-const { getDefaultMode, normalizeMode, writeDefaultMode } = require('../../hooks/ponytail-config');
-const { parseCommandFile, parseSkillFile } = require('./ponytail-frontmatter.cjs');
+function projectHash(projectDir) {
+  return crypto
+    .createHash('sha256')
+    .update(String(projectDir || REPO_ROOT))
+    .digest('hex')
+    .slice(0, 16)
+}
 
-// OpenCode has no flag-file convention of its own; keep mode beside its config.
-// Shared with the V1 path, so a level set under either API is read by both.
-const statePath = path.join(
-  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
-  'opencode',
-  '.ponytail-active',
-);
+function stateFileForProject(projectDir) {
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config')
+  return path.join(base, 'opencode', 'ponytail', `${projectHash(projectDir)}.json`)
+}
 
-function readMode() {
+function isSafeSessionKey(k) {
+  return (
+    typeof k === 'string' &&
+    k.length > 0 &&
+    k.length <= 128 &&
+    k !== '__proto__' &&
+    k !== 'constructor' &&
+    k !== 'prototype'
+  )
+}
+
+export function readProjectMode(projectDir, sessionID = null) {
+  if (isSafeSessionKey(sessionID) && sessionModes.has(sessionID)) {
+    return sessionModes.get(sessionID)
+  }
+  const file = stateFileForProject(projectDir)
   try {
-    // review is a one-shot command, never a level (#736); an old saved review falls back.
-    return normalizeMode(fs.readFileSync(statePath, 'utf8')) || getDefaultMode();
-  } catch (e) {
-    return getDefaultMode();
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (
+      isSafeSessionKey(sessionID) &&
+      parsed &&
+      typeof parsed.sessions === 'object' &&
+      parsed.sessions !== null &&
+      Object.hasOwn(parsed.sessions, sessionID) &&
+      ['lite', 'full', 'ultra', 'off'].includes(parsed.sessions[sessionID])
+    ) {
+      return parsed.sessions[sessionID]
+    }
+    if (['lite', 'full', 'ultra', 'off'].includes(parsed?.defaultMode)) {
+      return parsed.defaultMode
+    }
+  } catch {
+    // default to full when uninitialized
   }
+  return 'full'
 }
 
-function writeMode(mode) {
-  fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  fs.writeFileSync(statePath, mode);
-}
-
-// `off` is persisted like any mode; the injection reads it and stays silent.
-// An unrecognized level leaves the current one alone. The write lands before
-// the next turn's injection, not the current one — good enough; switch to a
-// synchronous store if same-turn switching ever matters.
-function persistMode(args) {
-  const wanted = String(args == null ? '' : args).trim();
-  // `/ponytail default <level>` saves the default for new sessions, like the Claude hook.
-  const [first, second] = wanted.toLowerCase().split(/\s+/);
-  if (first === 'default') {
-    const saved = writeDefaultMode(second);
-    if (saved) console.log('ponytail default ' + saved);
-    return;
+export function writeProjectMode(projectDir, mode, sessionID = null) {
+  const normalized = ['lite', 'full', 'ultra', 'off'].includes(mode) ? mode : 'full'
+  if (isSafeSessionKey(sessionID)) {
+    if (sessionModes.size >= 256 && !sessionModes.has(sessionID)) {
+      const oldestKey = sessionModes.keys().next().value
+      if (oldestKey !== undefined) sessionModes.delete(oldestKey)
+    }
+    sessionModes.set(sessionID, normalized)
   }
-  // Bare /ponytail switches ponytail on, or keeps the level when it already is (#639).
-  if (!wanted && readMode() !== 'off') return;
-  const mode = wanted ? normalizeMode(wanted) : (getDefaultMode() === 'off' ? 'full' : getDefaultMode());
-  if (!mode) return;
-  writeMode(mode);
-  console.log('ponytail ' + mode);
-}
-
-// V2 has no `config` hook: the domains that own these definitions own them now,
-// so the command and skill files are read once here and handed to the
-// transforms that register them.
-function readCommands() {
-  const dir = path.join(__dirname, '..', 'command');
+  const file = stateFileForProject(projectDir)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const safeSessions = Object.create(null)
   try {
-    return fs.readdirSync(dir)
-      .filter((file) => file.endsWith('.md'))
-      .map((file) => {
-        const parsed = parseCommandFile(path.join(dir, file));
-        return parsed && { name: path.basename(file, '.md'), ...parsed };
-      })
-      .filter(Boolean);
-  } catch (e) {
-    return [];
-  }
-}
-
-function readSkills() {
-  const dir = path.resolve(__dirname, '../../skills');
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => {
-        const file = path.join(dir, entry.name, 'SKILL.md');
-        const parsed = parseSkillFile(file);
-        return parsed && {
-          id: entry.name,
-          name: parsed.name || entry.name,
-          description: parsed.description,
-          path: file,
-          content: parsed.body,
-        };
-      })
-      .filter(Boolean);
-  } catch (e) {
-    return [];
-  }
-}
-
-// Templates without $ARGUMENTS would drop what the user typed after the
-// command (/ponytail-review feature/login), so append it instead.
-function withArguments(template, input) {
-  const text = String(input == null ? '' : input);
-  if (template.includes('$ARGUMENTS')) return template.replaceAll('$ARGUMENTS', text);
-  return text.trim() ? template + '\n\n' + text.trim() : template;
-}
-
-export default {
-  id: 'ponytail',
-
-  async setup(ctx) {
-    const commands = readCommands();
-    const skills = readSkills();
-
-    await ctx.skill.transform((editor) => {
-      for (const skill of skills) editor.add(skill);
-    });
-
-    await ctx.command.transform((editor) => {
-      for (const command of commands) {
-        editor.add({
-          name: command.name,
-          description: command.description,
-          execute: async ({ sessionID, prompt, delivery }) => {
-            if (command.name === 'ponytail') persistMode(prompt.text);
-            const withoutMentions = (items) => items?.map(({ mention, ...item }) => item);
-            await ctx.session.prompt({
-              ...prompt,
-              sessionID,
-              text: withArguments(command.template, prompt.text),
-              files: withoutMentions(prompt.files),
-              agents: withoutMentions(prompt.agents),
-              skills: withoutMentions(prompt.skills),
-              delivery,
-            });
-          },
-        });
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (parsed && typeof parsed.sessions === 'object' && parsed.sessions !== null) {
+      for (const [k, v] of Object.entries(parsed.sessions)) {
+        if (isSafeSessionKey(k) && ['lite', 'full', 'ultra', 'off'].includes(v)) {
+          safeSessions[k] = v
+        }
       }
-    });
+    }
+  } catch {
+    // ignore missing or corrupt state file
+  }
+  if (isSafeSessionKey(sessionID)) {
+    safeSessions[sessionID] = normalized
+  }
+  const keys = Object.keys(safeSessions)
+  while (keys.length > 100) {
+    const evict = keys.shift()
+    if (evict) delete safeSessions[evict]
+  }
+  const payload = {
+    defaultMode: normalized,
+    sessions: safeSessions,
+    updatedAt: new Date().toISOString(),
+  }
+  fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
+  return normalized
+}
 
-    // Append the ruleset to the system prompt every turn. V2 hands over owned
-    // system parts, so push one instead of rewriting the tail of another.
-    // Summary compaction runs its own hook with the same event shape; without
-    // it the compaction request misses the ruleset and the provider prompt cache.
-    const addRuleset = (event) => {
-      const mode = readMode();
-      if (mode === 'off') return;
-      event.system.push({ type: 'text', text: getPonytailInstructions(mode) });
-    };
-    await ctx.session.hook('context', addRuleset);
-    await ctx.session.hook('compaction', addRuleset);
+function loadSkillPrompt(mode) {
+  if (mode === 'off') return ''
+  const skillPath = path.join(REPO_ROOT, 'skills', 'ponytail', 'SKILL.md')
+  try {
+    const content = fs.readFileSync(skillPath, 'utf8')
+    return `[Ponytail Mode: ${mode.toUpperCase()}]\n${content}`
+  } catch {
+    return `[Ponytail Mode: ${mode.toUpperCase()}]`
+  }
+}
+
+function createHooks(projectDir) {
+  return {
+    'command.execute.before': async (input) => {
+      if (input?.command !== 'ponytail') return
+      const arg = String(input?.arguments || '').trim().split(/\s+/)[0]
+      if (['lite', 'full', 'ultra', 'off'].includes(arg)) {
+        writeProjectMode(projectDir, arg, input?.sessionID || null)
+      }
+    },
+    'experimental.chat.system.transform': async (input, output) => {
+      const sessionID = input?.sessionID || null
+      const mode = readProjectMode(projectDir, sessionID)
+      if (mode === 'off') return
+      const prompt = loadSkillPrompt(mode)
+      if (prompt && Array.isArray(output?.system)) {
+        output.system.push(prompt)
+      }
+    },
+    'experimental.session.compacting': async (input, output) => {
+      const sessionID = input?.sessionID || null
+      const mode = readProjectMode(projectDir, sessionID)
+      if (mode === 'off') return
+      if (Array.isArray(output?.context)) {
+        output.context.push(`Ponytail active mode (${mode}) preserved across context compaction.`)
+      }
+    },
+  }
+}
+
+const plugin = {
+  id: 'ponytail-opencode',
+  async setup(ctx) {
+    const projectDir = ctx?.directory || ctx?.worktree || process.cwd()
+    const hooks = createHooks(projectDir)
+    if (ctx?.session?.hook) {
+      await ctx.session.hook('context', (event) => {
+        const mode = readProjectMode(projectDir, event?.sessionID || null)
+        if (mode === 'off') return
+        event.system.push({ type: 'text', text: loadSkillPrompt(mode) })
+      })
+      await ctx.session.hook('compaction', (event) => {
+        const mode = readProjectMode(projectDir, event?.sessionID || null)
+        if (mode === 'off') return
+        event.system.push({ type: 'text', text: loadSkillPrompt(mode) })
+      })
+    }
+    return hooks
   },
-
-  // OpenCode V1: same three behaviors, as hooks on the V1 hook names.
-  async server({ client } = {}) {
-    const log = (level, message) => {
-      try { client && client.app && client.app.log({ body: { service: 'ponytail', level, message } }); } catch (e) {}
-    };
-
-    return {
-      // Register slash commands + skills directory.
-      config: async (config) => {
-        if (!config.command) config.command = {};
-        for (const command of readCommands()) {
-          config.command[command.name] = { description: command.description, template: command.template };
-        }
-
-        config.skills = config.skills || {};
-        config.skills.paths = config.skills.paths || [];
-        const ponytailSkillsDir = path.resolve(__dirname, '../../skills');
-        if (!config.skills.paths.includes(ponytailSkillsDir)) {
-          config.skills.paths.push(ponytailSkillsDir);
-        }
-      },
-
-      'experimental.chat.system.transform': async (_input, output) => {
-        const mode = readMode();
-        if (mode === 'off') return;
-        const instructions = getPonytailInstructions(mode);
-        if (output.system.length > 0) {
-          output.system[output.system.length - 1] += '\n\n' + instructions;
-        } else {
-          output.system.push(instructions);
-        }
-      },
-
-      'command.execute.before': async (input) => {
-        if (!input || input.command !== 'ponytail') return;
-        persistMode(input.arguments);
-        log('info', 'ponytail ' + readMode());
-      },
-    };
+  async server(ctx = {}) {
+    const projectDir = ctx?.directory || ctx?.worktree || process.cwd()
+    return createHooks(projectDir)
   },
-};
+}
+
+export const server = plugin.server
+export default plugin
