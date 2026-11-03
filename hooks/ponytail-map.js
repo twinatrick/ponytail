@@ -42,8 +42,8 @@ function listFiles(root) {
     const tracked = execFileSync('git', ['ls-files'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean).slice(0, MAX_FILES * 5);
     if (tracked.length) return tracked;
-  } catch (e) { /* not a git repo: walk below */ }
-  {
+  } catch (e) { /* not a git repo */ }
+  if (process.env.PONYTAIL_MAP_ALLOW_NONGIT === '1') {
     // No git, or an untracked folder inside a parent repo (git ls-files is then empty, not an error).
     const out = [];
     (function walk(dir, depth) {
@@ -57,6 +57,7 @@ function listFiles(root) {
     })(root, 0);
     return out;
   }
+  return [];
 }
 
 function namesIn(file, text) {
